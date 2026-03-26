@@ -453,7 +453,8 @@ input[type=range]::-webkit-slider-thumb {
 <script>
 let BRIDGE = localStorage.getItem('hue_ip')  || '192.168.172.133';
 let KEY    = localStorage.getItem('hue_key') || 'QKli4duV782xNupy1JaDq7QQnQhDc3Srazaji9iX';
-let lights = {}, currentTab = 'lights', modalLightId = null;
+let lights = {}, bridgeGroups = {}, bridgeScenes = {};
+let currentTab = 'lights', modalLightId = null, modalRoomName = null;
 
 const PRESETS = [
   { name:'Vit',    hex:'#fff9f0', ct:300 },
@@ -506,9 +507,15 @@ async function api(method, path, body) {
 async function refreshAll() {
   setStatus(null,'Uppdaterar…');
   try {
-    const data = await api('GET','/lights');
-    if (Array.isArray(data)) throw new Error(data[0]?.error?.description || 'API-fel');
-    lights = data;
+    const [lData, gData, sData] = await Promise.all([
+      api('GET','/lights'),
+      api('GET','/groups'),
+      api('GET','/scenes'),
+    ]);
+    if (Array.isArray(lData)) throw new Error(lData[0]?.error?.description || 'API-fel');
+    lights = lData;
+    bridgeGroups = gData;
+    bridgeScenes = sData;
     const on = Object.values(lights).filter(l=>l.state.on).length;
     setStatus(true,`${Object.keys(lights).length} lampor · ${on} tända`);
     renderTab();
@@ -535,17 +542,44 @@ async function setRoom(name, body) {
   } catch(e) { setStatus(false,'Fel: '+e.message); }
 }
 
-async function activateScene(sc) {
-  const ids = (ROOMS[sc.room]?.lights||[]).filter(id=>lights[id]);
-  const body = { on:true, bri:sc.bri, transitiontime:10 };
-  if (sc.ct) body.ct = sc.ct;
-  if (sc.xy) body.xy = sc.xy;
+async function activateHueScene(sceneId) {
+  const sc = bridgeScenes[sceneId];
+  if (!sc) return;
+  const groupId = Object.keys(bridgeGroups).find(id=>bridgeGroups[id].name===sc.group);
   try {
-    await Promise.all(ids.map(id=>api('PUT',`/lights/${id}/state`,body)));
-    ids.forEach(id=>Object.assign(lights[id].state,body));
+    if (groupId) {
+      await api('PUT',`/groups/${groupId}/action`,{scene:sceneId});
+    } else {
+      await api('PUT',`/groups/0/action`,{scene:sceneId});
+    }
     setStatus(true,`"${sc.name}" aktiverad`);
-    renderTab();
+    setTimeout(refreshAll, 800);
   } catch(e) { setStatus(false,'Fel: '+e.message); }
+}
+
+function getScenesForRoom(roomName) {
+  const roomLightIds = new Set(ROOMS[roomName]?.lights || []);
+  return Object.entries(bridgeScenes)
+    .filter(([,sc]) => {
+      if (!sc.lights || sc.lights.length === 0) return false;
+      return sc.lights.some(lid => roomLightIds.has(lid));
+    })
+    .map(([id, sc]) => ({ id, name: sc.name }))
+    .sort((a,b) => a.name.localeCompare(b.name));
+}
+
+function openRoomColorModal(roomName) {
+  modalRoomName = roomName;
+  modalLightId = null;
+  const valid = (ROOMS[roomName]?.lights||[]).filter(id=>lights[id]);
+  const avgBri = valid.length ? Math.round(valid.reduce((s,id)=>s+(lights[id].state.bri||1),0)/valid.length) : 200;
+  const avgCt = valid.length ? Math.round(valid.reduce((s,id)=>s+(lights[id].state.ct||300),0)/valid.length) : 300;
+  document.getElementById('modal-name').textContent = roomName + ' — Färg & ljus';
+  document.getElementById('mbri').value = avgBri;
+  document.getElementById('mbri-v').textContent = Math.round(avgBri/254*100)+'%';
+  document.getElementById('mct').value = avgCt;
+  ctLabel(avgCt);
+  document.getElementById('cmodal').classList.add('open');
 }
 
 function switchTab(tab, el) {
@@ -600,17 +634,13 @@ function renderLights() {
   }).join('');
 }
 
-function toggleGroup(el) {
-  el.classList.toggle('expanded');
-}
-
 function renderGroups() {
   return Object.entries(ROOMS).map(([name,g])=>{
     const valid=g.lights.filter(id=>lights[id]);
     const onC=valid.filter(id=>lights[id].state.on).length;
     const avgBri = valid.length ? Math.round(valid.reduce((s,id)=>s+(lights[id].state.bri||1),0)/valid.length) : 1;
     const briPct = Math.round(avgBri/254*100);
-    const roomScenes = SCENES.filter(sc=>sc.room===name);
+    const roomScenes = getScenesForRoom(name);
     return `<div class="group-card ${onC>0?'on':''}">
       <div class="group-header" onclick="this.parentElement.classList.toggle('expanded')">
         <div class="group-emoji">${g.icon}</div>
@@ -632,14 +662,14 @@ function renderGroups() {
             oninput="setRoom('${name}',{bri:+this.value})"
             style="background:linear-gradient(to right,var(--accent) ${briPct}%,var(--surface3) ${briPct}%)">
           <span class="bri-pct">${briPct}%</span>
+          <div class="cswatch" style="background:conic-gradient(red,yellow,lime,cyan,blue,magenta,red);width:26px;height:26px;flex-shrink:0" onclick="openRoomColorModal('${name}')"></div>
         </div>
         ${roomScenes.length ? `<div class="group-scenes">
           ${roomScenes.map(sc=>`
-            <div class="group-scene-btn" onclick='activateScene(${JSON.stringify(sc)})'>
-              <span class="group-scene-icon">${sc.icon}</span>
+            <div class="group-scene-btn" onclick="activateHueScene('${sc.id}')">
               <span class="group-scene-name">${sc.name}</span>
             </div>`).join('')}
-        </div>` : ''}
+        </div>` : '<div style="font-size:12px;color:var(--text3);padding:4px 0">Inga scener hittades</div>'}
       </div>
     </div>`;
   }).join('');
@@ -678,6 +708,7 @@ function applyPreset(id,i) {
 
 function openModal(id) {
   modalLightId=id;
+  modalRoomName=null;
   const s=lights[id].state;
   document.getElementById('modal-name').textContent=lights[id].name;
   document.getElementById('mbri').value=s.bri||200;
@@ -691,10 +722,19 @@ function mPickColor(i){
   document.querySelectorAll('.hswatch').forEach((s,j)=>s.classList.toggle('sel',i===j));
   const p=PRESETS[i],b={on:true};
   if(p.ct)b.ct=p.ct; else b.xy=p.xy;
-  if(modalLightId)setLight(modalLightId,b);
+  if(modalLightId) setLight(modalLightId,b);
+  else if(modalRoomName) setRoom(modalRoomName,b);
 }
-function mBri(v){ document.getElementById('mbri-v').textContent=Math.round(v/254*100)+'%'; if(modalLightId)setLight(modalLightId,{bri:+v}); }
-function mCt(v){ ctLabel(+v); if(modalLightId)setLight(modalLightId,{ct:+v,colormode:'ct'}); }
+function mBri(v){
+  document.getElementById('mbri-v').textContent=Math.round(v/254*100)+'%';
+  if(modalLightId) setLight(modalLightId,{bri:+v});
+  else if(modalRoomName) setRoom(modalRoomName,{bri:+v});
+}
+function mCt(v){
+  ctLabel(+v);
+  if(modalLightId) setLight(modalLightId,{ct:+v,colormode:'ct'});
+  else if(modalRoomName) setRoom(modalRoomName,{ct:+v,colormode:'ct'});
+}
 function ctLabel(ct){ document.getElementById('mct-v').textContent=ct<200?'Kall':ct<320?'Neutral':ct<420?'Varm':'Glöd'; }
 
 function setStatus(ok,msg){
